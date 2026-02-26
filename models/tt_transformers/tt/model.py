@@ -31,6 +31,8 @@ class Transformer(LightweightModule):
         paged_attention_config=None,
         use_paged_kv_cache=False,
         attention_class=None,
+        moe_class=None,
+        moe_kwargs=None,
         rope_setup_class=None,
         prefetcher=None,
     ):
@@ -101,6 +103,8 @@ class Transformer(LightweightModule):
                 paged_attention_config=paged_attention_config,
                 use_paged_kv_cache=use_paged_kv_cache,
                 attention_class=attention_class,
+                moe_class=moe_class,
+                moe_kwargs=moe_kwargs,
                 prefetcher=prefetcher,
             )
             for i in tqdm(range(self.n_layers))

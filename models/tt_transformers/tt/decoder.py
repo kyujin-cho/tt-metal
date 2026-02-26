@@ -27,6 +27,8 @@ class TransformerBlock(LightweightModule):
         paged_attention_config=None,
         use_paged_kv_cache=False,
         attention_class=None,
+        moe_class=None,
+        moe_kwargs=None,
         prefetcher=None,
     ):
         super().__init__()
@@ -65,25 +67,36 @@ class TransformerBlock(LightweightModule):
         )
 
         if getattr(self.args, "is_mixture_of_experts", False):
-            self.feed_forward = TtMoeLayer(
-                mesh_device=mesh_device,
-                state_dict=state_dict,
-                experts=TtMixtralMLP(
+            if moe_class is not None:
+                self.feed_forward = moe_class(
                     mesh_device=mesh_device,
                     state_dict=state_dict,
                     args=args,
                     layer_num=layer_num,
-                    dtypes={
-                        "w1": dtype,
-                        "w2": dtype,
-                        "w3": dtype,
-                    },
-                ),
-                args=args,
-                layer_num=layer_num,
-                dtype=dtype,
-                tt_ccl=self.tt_ccl,
-            )
+                    dtype=dtype,
+                    tt_ccl=self.tt_ccl,
+                    **(moe_kwargs or {}),
+                )
+            else:
+                self.feed_forward = TtMoeLayer(
+                    mesh_device=mesh_device,
+                    state_dict=state_dict,
+                    experts=TtMixtralMLP(
+                        mesh_device=mesh_device,
+                        state_dict=state_dict,
+                        args=args,
+                        layer_num=layer_num,
+                        dtypes={
+                            "w1": dtype,
+                            "w2": dtype,
+                            "w3": dtype,
+                        },
+                    ),
+                    args=args,
+                    layer_num=layer_num,
+                    dtype=dtype,
+                    tt_ccl=self.tt_ccl,
+                )
         else:
             self.feed_forward = MLP(
                 mesh_device=mesh_device,

@@ -6,6 +6,7 @@ import inspect
 import json
 import math
 import os
+import re
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -2618,6 +2619,17 @@ class ModelArgs:
 
         self.query_pre_attn_scalar = text_config.get("query_pre_attn_scalar", None)
 
+        # Partial RoPE support (e.g., MiniMax-M2.5 uses partial_rotary_factor=0.5)
+        self.partial_rotary_factor = text_config.get("partial_rotary_factor", 1.0)
+        self.rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+
+        # MoE-specific config fields
+        self.moe_intermediate_size = text_config.get("moe_intermediate_size", None)
+        self.n_routed_experts = text_config.get("n_routed_experts", None)
+        self.n_shared_experts = text_config.get("n_shared_experts", 0)
+        self.routed_scaling_factor = text_config.get("routed_scaling_factor", 1.0)
+        self.norm_topk_prob = text_config.get("norm_topk_prob", False)
+
         # Configurable MLP activation type
         self.mlp_activation_type = self._get_hidden_activation_type(text_config)
 
@@ -2716,7 +2728,7 @@ class ModelArgs:
             vision_config.update({k: v for k, v in base_config.items() if k not in ["text_config", "vision_config"]})
             return vision_config
 
-        from transformers import AutoConfig
+        from transformers import AutoConfig, PretrainedConfig
 
         if self.dummy_weights:
             logger.info(f"Loading state param for dummy {self.model_name} from {self.LOCAL_HF_PARAMS[self.model_name]}")
@@ -2724,11 +2736,20 @@ class ModelArgs:
                 self.LOCAL_HF_PARAMS[self.model_name], trust_remote_code=self.trust_remote_code_hf
             )
         else:
-            self.hf_config = AutoConfig.from_pretrained(
-                self.CKPT_DIR,
-                trust_remote_code=self.trust_remote_code_hf,
-                local_files_only=os.getenv("CI") == "true",
-            )
+            try:
+                self.hf_config = AutoConfig.from_pretrained(
+                    self.CKPT_DIR,
+                    trust_remote_code=self.trust_remote_code_hf,
+                    local_files_only=os.getenv("CI") == "true",
+                )
+            except ValueError:
+                # Fallback for unrecognized model_type (e.g., "solar_open")
+                logger.warning(f"AutoConfig failed for {self.CKPT_DIR}, falling back to PretrainedConfig")
+                self.hf_config = PretrainedConfig.from_pretrained(
+                    self.CKPT_DIR,
+                    trust_remote_code=self.trust_remote_code_hf,
+                    local_files_only=os.getenv("CI") == "true",
+                )
 
         config = self.hf_config.to_dict()
 
@@ -2915,18 +2936,25 @@ class ModelArgs:
         else:
             # Always HuggingFace since we only support HF_MODEL now
             model_cls = self.get_hf_model_cls()
-            model = model_cls.from_pretrained(
-                self.CKPT_DIR,
-                torch_dtype="auto",
-                trust_remote_code=self.trust_remote_code_hf,
-                local_files_only=os.getenv("CI") == "true"
-                # Note that the default setting is torch.dtype.float32, but model weights are
-                # may come in any dtype. If the model's weights are in torch.dtype.bfloat16, this would result in 2x memory usage from an
-                # unnecessary cast.
-            )
-            if self.cache_hf_flag:
-                self.cached_hf_model = model
-            state_dict = model.state_dict()
+            try:
+                model = model_cls.from_pretrained(
+                    self.CKPT_DIR,
+                    torch_dtype="auto",
+                    trust_remote_code=self.trust_remote_code_hf,
+                    local_files_only=os.getenv("CI") == "true"
+                    # Note that the default setting is torch.dtype.float32, but model weights are
+                    # may come in any dtype. If the model's weights are in torch.dtype.bfloat16, this would result in 2x memory usage from an
+                    # unnecessary cast.
+                )
+                if self.cache_hf_flag:
+                    self.cached_hf_model = model
+                state_dict = model.state_dict()
+            except (ValueError, KeyError) as e:
+                # Fallback for unrecognized model_type: load directly from safetensors
+                logger.warning(f"AutoModel failed for {self.CKPT_DIR}: {e}. Loading from safetensors.")
+                from models.tt_transformers.tt.load_checkpoints import load_hf_state_dict
+
+                state_dict = load_hf_state_dict(self.CKPT_DIR)
             self.is_mixture_of_experts = any([".experts." in k for k in state_dict.keys()])
 
         if self.is_multimodal:
@@ -2948,7 +2976,12 @@ class ModelArgs:
                 state_dict.pop(k)
         if getattr(self, "is_mixture_of_experts", False):
             self.moe = True
-            self.num_experts = max([int(item[-11]) + 1 for item in keys_dict if "block_sparse_moe.experts" in item])
+            expert_ids = [
+                int(re.search(r"experts\.(\d+)\.", item).group(1))
+                for item in keys_dict
+                if re.search(r"\.experts\.(\d+)\.", item)
+            ]
+            self.num_experts = max(expert_ids) + 1 if expert_ids else 0
         return state_dict
 
     # =========================================================================
